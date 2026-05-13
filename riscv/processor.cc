@@ -932,6 +932,18 @@ reg_t illegal_instruction(processor_t* p, insn_t insn, reg_t pc)
 
 insn_func_t processor_t::decode_insn(insn_t insn)
 {
+  // Ventus custom opcodes intentionally occupy encodings that look like RVC
+  // halfwords. Prefer full-word custom matches before the generic list can
+  // claim the low half as a compressed instruction.
+  const insn_bits_t opcode = insn.bits() & 0x7f;
+  if (unlikely(opcode == 0x42 || opcode == 0x72)) {
+    for (auto p = instructions.begin(); p != instructions.end(); ++p) {
+      const bool full_opcode_match = (p->mask & 0x7f) == 0x7f && (p->match & 0x7f) == opcode;
+      if (full_opcode_match && (insn.bits() & p->mask) == p->match)
+        return p->func(xlen, extension_enabled('E'));
+    }
+  }
+
   // look up opcode in hash table
   size_t idx = insn.bits() % OPCODE_CACHE_SIZE;
   insn_desc_t desc = opcode_cache[idx];

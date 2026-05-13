@@ -1,5 +1,6 @@
 // CP_ASYNC_BULK: copy RS2 bytes from RS1 (global mem) to reg[rd] (shared mem)
 {
+  npc = sext_xlen(pc + 4);
   reg_t src  = RS1;
   reg_t size = RS2;
   reg_t dst  = READ_REG(insn.rd());

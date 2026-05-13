@@ -2263,6 +2263,21 @@ const disasm_insn_t* disassembler_t::probe_once(insn_t insn, size_t idx) const
 
 const disasm_insn_t* disassembler_t::lookup(insn_t insn) const
 {
+  const insn_bits_t opcode = insn.bits() & 0x7f;
+  if (opcode == 0x42 || opcode == 0x72) {
+    for (size_t i = 0; i < HASH_SIZE + 1; i++) {
+      for (auto it = chain[i].rbegin(); it != chain[i].rend(); ++it) {
+        const auto candidate = *it;
+        const bool ventus_fullword =
+          (candidate->get_mask() & 0xffff0000) != 0 &&
+          (candidate->get_mask() & 0x7f) == 0x7f &&
+          (candidate->get_match() & 0x7f) == opcode;
+        if (ventus_fullword && *candidate == insn)
+          return candidate;
+      }
+    }
+  }
+
   if (auto p = probe_once(insn, hash(insn.bits(), MASK1)))
     return p;
 

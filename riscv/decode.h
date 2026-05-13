@@ -65,6 +65,9 @@ const int NCSR = 4096;
 #define FSR_NXA  (FPEXC_NX << FSR_AEXC_SHIFT)
 #define FSR_AEXC (FSR_NVA | FSR_OFA | FSR_UFA | FSR_DZA | FSR_NXA)
 
+// Ventus custom opcodes 0x72 and 0x42 are emitted as 32-bit .word
+// instructions even though their low bits do not follow the standard RISC-V
+// length encoding. Keep fetch/icache in lockstep with the custom handlers.
 #define insn_length(x) \
   (((x) & 0x7f) == 0x72 ? 4 : \
    ((x) & 0x7f) == 0x42 ? 4 : \

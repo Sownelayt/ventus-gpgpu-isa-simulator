@@ -925,6 +925,8 @@ riscv_insn_ext_v_gpgpu = \
 	cp_async_bulk \
 	cp_async_tensor \
 	cp_async_fence \
+	prefetch_tensormap \
+	cp_async_tensor_g2s \
 	vftta_vv \
 	vfexp_v \
 
