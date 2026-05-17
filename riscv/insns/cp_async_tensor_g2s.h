@@ -3,7 +3,7 @@
 // Operands:
 //   rd  = shared-memory destination pointer
 //   rs1 = global-memory tensor map descriptor pointer
-//   rs2 = dynamic coordinates block pointer, or 0 for all-zero coords
+//   rs2 = VGPR dynamic parameter block
 //
 // Descriptor v0 is 128B / 32 u32 words:
 //   word 0      magic/version/flags, currently informational
@@ -17,23 +17,20 @@
 //   word 19..23 elementStrides[0..4]
 //   word 24..31 reserved
 //
-// Dynamic block v0:
+// VGPR dynamic block v0:
 //   word 0..4   tensorCoords[0..4]
 {
   npc = sext_xlen(pc + 4);
   reg_t dstAddr = READ_REG(insn.rd());
   reg_t descPtr = RS1;
-  reg_t dynPtr  = RS2;
 
   reg_t desc[32];
   for (int i = 0; i < 32; i++)
     desc[i] = (reg_t)MMU.load_uint32(descPtr + 4 * i);
 
   reg_t coords[5] = {0, 0, 0, 0, 0};
-  if (dynPtr != 0) {
-    for (int i = 0; i < 5; i++)
-      coords[i] = (reg_t)MMU.load_uint32(dynPtr + 4 * i);
-  }
+  for (int i = 0; i < 5; i++)
+    coords[i] = (reg_t)P.VU.elt<uint32_t>(2, insn.rs2(), i);
 
   static const bool debug = std::getenv("VENTUS_TMA_G2S_DEBUG") != nullptr;
 
@@ -103,13 +100,13 @@
   if (debug) {
     fprintf(stderr,
             "cp.async.tensor.g2s: dst=0x%08llx"
-            " desc=0x%08llx dyn=0x%08llx"
+            " desc=0x%08llx dyn_vreg=v%u"
             " ctrl=0x%08llx rank=%u dtype=%u global=0x%08llx"
             " coords=[%u,%u,%u,%u,%u] boxAddr=0x%08llx"
             " gdim=[%u,%u,%u,%u,%u] stride=[%u,%u,%u,%u,%u]"
             " box=[%u,%u,%u,%u,%u]\n",
             (unsigned long long)dstAddr, (unsigned long long)descPtr,
-            (unsigned long long)dynPtr, (unsigned long long)control,
+            (unsigned)insn.rs2(), (unsigned long long)control,
             (unsigned)rank, (unsigned)dataType,
             (unsigned long long)globalAddress,
             (unsigned)coords[0], (unsigned)coords[1], (unsigned)coords[2],
