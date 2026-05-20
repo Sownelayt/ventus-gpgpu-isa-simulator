@@ -1,7 +1,8 @@
-// CP_ASYNC_TENSOR_G2S: descriptor-addressed tensor copy from global to shared.
+
+// CP_ASYNC_TENSOR_S2G: descriptor-addressed tensor copy from shared to global.
 //
 // Operands:
-//   rd  = shared-memory destination pointer
+//   rd  = shared-memory source pointer
 //   rs1 = global-memory tensor map descriptor pointer
 //   rs2 = VGPR dynamic parameter block
 //
@@ -21,7 +22,7 @@
 //   word 0..4   tensorCoords[0..4]
 {
   npc = sext_xlen(pc + 4);
-  reg_t dstAddr = READ_REG(insn.rd());
+  reg_t sharedSrcAddr = READ_REG(insn.rd());
   reg_t descPtr = RS1;
 
   reg_t desc[32];
@@ -32,14 +33,13 @@
   for (int i = 0; i < 5; i++)
     coords[i] = (reg_t)P.VU.elt<uint32_t>(2, insn.rs2(), i);
 
-  static const bool debug = std::getenv("VENTUS_TMA_G2S_DEBUG") != nullptr;
+  static const bool debug = std::getenv("VENTUS_TMA_DESC_DEBUG") != nullptr;
 
   reg_t control = desc[1];
   reg_t dataType = control & 0xf;
   reg_t rank = (control >> 4) & 0xf;
   reg_t interleaveMode = (control >> 8) & 0x3;
   reg_t swizzleMode = (control >> 10) & 0x3;
-  reg_t oobfill = (control >> 14) & 0x1;
 
   reg_t globalAddress = desc[2];
   reg_t globalDim[5];
@@ -69,7 +69,7 @@
     case 11: elemSize = 8; break; // FP64
     default:
       fprintf(stderr,
-              "cp.async.tensor.g2s: unknown dataType=%u, defaulting elemSize=4\n",
+              "cp.async.tensor_s2g: unknown dataType=%u, defaulting elemSize=4\n",
               (unsigned)dataType);
       elemSize = 4;
       break;
@@ -77,35 +77,60 @@
 
   if (rank == 0 || rank > 5) {
     fprintf(stderr,
-            "cp.async.tensor.g2s: unsupported rank=%u (must be 1..5); skipping\n",
+            "cp.async.tensor_s2g: unsupported rank=%u (must be 1..5); skipping\n",
             (unsigned)rank);
     return npc;
   }
-  if (interleaveMode != 0) {
+  if (interleaveMode == 3) {
     fprintf(stderr,
-            "cp.async.tensor.g2s: unsupported interleaveMode=%u; skipping\n",
+            "cp.async.tensor_s2g: reserved interleaveMode=%u; skipping\n",
+            (unsigned)interleaveMode);
+    return npc;
+  }
+  if (interleaveMode != 0 && rank < 3) {
+    fprintf(stderr,
+            "cp.async.tensor_s2g: interleaveMode=%u requires rank >= 3; skipping\n",
             (unsigned)interleaveMode);
     return npc;
   }
 
-  // Descriptor v0 carries dim0 byte stride explicitly. Keep old dense tests
-  // robust by accepting zero there as "elemSize".
   if (byteStride[0] == 0)
     byteStride[0] = elemSize;
 
-  reg_t boxAddr = globalAddress;
-  for (reg_t d = 0; d < rank; d++)
-    boxAddr += coords[d] * byteStride[d];
+  auto tensor_addr = [&](const reg_t c[5]) -> reg_t {
+    if (interleaveMode == 0) {
+      reg_t addr = globalAddress;
+      for (reg_t d = 0; d < rank; d++)
+        addr += c[d] * byteStride[d];
+      return addr;
+    }
+
+    reg_t sliceBytes = (interleaveMode == 1) ? 16 : 32;
+    reg_t channelsPerSlice = elemSize ? (sliceBytes / elemSize) : 1;
+    if (channelsPerSlice == 0) channelsPerSlice = 1;
+    reg_t cSlice = c[0] / channelsPerSlice;
+    reg_t cInSlice = c[0] % channelsPerSlice;
+    reg_t cSliceStride = sliceBytes;
+    if (rank >= 3)
+      cSliceStride = byteStride[rank - 2] * globalDim[rank - 2];
+
+    reg_t addr = globalAddress + cInSlice * elemSize + cSlice * cSliceStride;
+    for (reg_t d = 1; d < rank; d++)
+      addr += c[d] * byteStride[d];
+    return addr;
+  };
+
+  reg_t boxAddr = tensor_addr(coords);
 
   if (debug) {
     fprintf(stderr,
-            "cp.async.tensor.g2s: dst=0x%08llx"
+            "cp.async.tensor_s2g: src=0x%08llx"
             " desc=0x%08llx dyn_vreg=v%u"
             " ctrl=0x%08llx rank=%u dtype=%u global=0x%08llx"
             " coords=[%u,%u,%u,%u,%u] boxAddr=0x%08llx"
             " gdim=[%u,%u,%u,%u,%u] stride=[%u,%u,%u,%u,%u]"
             " box=[%u,%u,%u,%u,%u]\n",
-            (unsigned long long)dstAddr, (unsigned long long)descPtr,
+            (unsigned long long)sharedSrcAddr, (unsigned long long)descPtr,
             (unsigned)insn.rs2(), (unsigned long long)control,
             (unsigned)rank, (unsigned)dataType,
             (unsigned long long)globalAddress,
@@ -131,19 +156,9 @@
       outDim[d] = (boxDim[d] + eStride[d] - 1) / eStride[d];
   }
 
-  auto is_integer_dtype = [&](reg_t dt) -> bool {
-    return dt <= 5 || dt == 9 || dt == 10;
-  };
-
-  auto fill_oob = [&](reg_t dst) {
-    uint8_t fill = (!is_integer_dtype(dataType) && oobfill) ? 0xff : 0x00;
-    for (reg_t b = 0; b < elemSize; b++)
-      MMU.store_uint8(dst + b, fill);
-  };
-
-  auto swizzle_dst_offset = [&](reg_t logical_off, reg_t row) -> reg_t {
+  auto swizzleSrcOffset = [&](reg_t logical_off, reg_t row) -> reg_t {
     if (swizzleMode == 0) return logical_off;
-    reg_t chunk_bits = swizzleMode;         // 1/2/3 for 32B/64B/128B
+    reg_t chunk_bits = swizzleMode;
     reg_t span = 16 << chunk_bits;
     reg_t chunk_mask = (1 << chunk_bits) - 1;
     reg_t low = logical_off & 0xf;
@@ -164,13 +179,12 @@
       rem /= outDim[d];
     }
 
-    reg_t src_off = 0;
+    reg_t logicalCoord[5] = {0, 0, 0, 0, 0};
     bool oob = false;
     for (reg_t d = 0; d < rank; d++) {
-      reg_t coord = coords[d] + idx[d] * eStride[d];
-      if (coord >= globalDim[d])
+      logicalCoord[d] = coords[d] + idx[d] * eStride[d];
+      if (logicalCoord[d] >= globalDim[d])
         oob = true;
-      src_off += idx[d] * eStride[d] * byteStride[d];
     }
 
     reg_t dst_off = 0;
@@ -185,13 +199,11 @@
       row += idx[d] * row_mul;
       row_mul *= outDim[d];
     }
-    dst_off = swizzle_dst_offset(dst_off, row);
+    dst_off = swizzleSrcOffset(dst_off, row);
 
-    reg_t src = boxAddr + src_off;
-    reg_t dst = dstAddr + dst_off;
-    if (oob) {
-      fill_oob(dst);
-    } else {
+    reg_t src = sharedSrcAddr + dst_off;
+    reg_t dst = tensor_addr(logicalCoord);
+    if (!oob) {
       switch (elemSize) {
         case 8:
           MMU.store_uint64(dst, MMU.load_uint64(src));

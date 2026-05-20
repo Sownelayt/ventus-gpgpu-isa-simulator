@@ -1,84 +1,58 @@
-// CP_ASYNC_TENSOR: copy a multi-dim tensor "box" from global memory to shared
-// memory, using a descriptor read directly from VGPR operands.
+// CP_ASYNC_TENSOR: descriptor-addressed tensor copy from global to shared.
 //
-// Descriptor layout (uint32 words), read from VGPRs v{rs1}, v{rs2}, v{rd}:
-//   VRS1 (param_buf[0..31])  — tensor descriptor
-//     [0]       dataType      (see table below)
-//     [1]       tensorRank    (1..5)
-//     [2]       globalAddress (unused here; BoxAddress below is used for the
-//                              actual copy source)
-//     [3..7]    globalDim[0..4]
-//     [8..12]   globalStrides[0..4]   (bytes between successive "rows/slices"
-//                                      along each dim; see offset formula)
-//   VRS2 (param_buf[32..63]) — box descriptor
-//     [0]       BoxAddress            (source base address in global mem)
-//     [1..5]    boxDim[0..4]          (extents of the sub-box to copy)
-//     [6..10]   elementStrides[0..4]  (step in elements, not bytes; 1 = dense)
-//     [11]      interleaveMode        (unsupported here except 0)
-//     [12]      swizzleMode           (0/1/2/3 = none/32B/64B/128B)
-//   VRS3 (param_buf[64..95]) — destination
-//     [0]       dst shared-memory address (tightly packed, row-major in
-//                                          boxDim shape, then optional swizzle)
+// Operands:
+//   rd  = shared-memory destination pointer
+//   rs1 = global-memory tensor map descriptor pointer
+//   rs2 = VGPR dynamic parameter block
 //
-// dataType encoding (kept in sync with host/kernel tests):
-//   0  UINT8     1 byte
-//   1  UINT16    2 bytes
-//   2  UINT32    4 bytes
-//   3  INT8      1 byte
-//   4  INT16     2 bytes
-//   5  INT32     4 bytes
-//   6  FP32      4 bytes
-//   7  FP16      2 bytes
-//   8  BF16      2 bytes
-//   9  UINT64    8 bytes
-//   10 INT64     8 bytes
-//   11 FP64      8 bytes
+// Descriptor v0 is 128B / 32 u32 words:
+//   word 0      magic/version/flags, currently informational
+//   word 1      bits [3:0] dataType, [7:4] rank, [9:8] interleave,
+//               [11:10] swizzle, [13:12] L2promotion, [14] oobfill
+//   word 2      globalAddress
+//   word 3      descriptor size/reserved
+//   word 4..8   globalDim[0..4]
+//   word 9..13  byteStride[0..4], including dim0 byte stride
+//   word 14..18 boxDim[0..4]
+//   word 19..23 elementStrides[0..4]
+//   word 24..31 reserved
 //
-// DMA in spike is synchronous, so the copy is done eagerly and the companion
-// CP_ASYNC_FENCE is a NOP. Because all lanes issue the same opcode with the
-// same descriptor values in VGPRs, the copy is idempotent: executing it N
-// times yields the same result as once.
-//
-// Offset formulae:
-//   Let dim_byte_stride(d) = elemSize           if d == 0
-//                          = globalStrides[d-1] if d >= 1
-//   Source offset for multi-index idx[]:
-//     src_off = Σ_d idx[d] * elementStrides[d] * dim_byte_stride(d)
-//   Destination offset (box is tightly packed, innermost dim first):
-//     dst_off = Σ_d idx[d] * prod_{k<d} boxDim[k] * elemSize
+// VGPR dynamic block v0:
+//   word 0..4   tensorCoords[0..4]
 {
   npc = sext_xlen(pc + 4);
-  auto u32 = [&](reg_t word_idx) -> reg_t {
-    if (word_idx < 32) {
-      return (reg_t)P.VU.elt<uint32_t>(1, insn.rs1(), word_idx);
-    }
-    if (word_idx < 64) {
-      return (reg_t)P.VU.elt<uint32_t>(2, insn.rs2(), word_idx - 32);
-    }
-    return (reg_t)P.VU.elt<uint32_t>(3, insn.rd(), word_idx - 64);
-  };
+  reg_t dstAddr = READ_REG(insn.rd());
+  reg_t descPtr = RS1;
 
-  // VRS1
-  reg_t dataType = u32(0);
-  reg_t rank     = u32(1);
-  reg_t gStride[5];
-  for (int i = 0; i < 5; i++) gStride[i] = u32(8 + i);
+  reg_t desc[32];
+  for (int i = 0; i < 32; i++)
+    desc[i] = (reg_t)MMU.load_uint32(descPtr + 4 * i);
 
-  // VRS2
-  reg_t boxAddr = u32(32);
-  reg_t boxDim[5] = {1, 1, 1, 1, 1};
-  for (reg_t i = 0; i < rank && i < 5; i++) boxDim[i] = u32(33 + i);
-  reg_t eStride[5] = {1, 1, 1, 1, 1};
-  for (reg_t i = 0; i < rank && i < 5; i++) eStride[i] = u32(38 + i);
-  reg_t interleaveMode = u32(43);
-  reg_t swizzleMode = u32(44);
+  reg_t coords[5] = {0, 0, 0, 0, 0};
+  for (int i = 0; i < 5; i++)
+    coords[i] = (reg_t)P.VU.elt<uint32_t>(2, insn.rs2(), i);
 
-  // VRS3
-  reg_t dstAddr = u32(64);
+  static const bool debug = std::getenv("VENTUS_TMA_DESC_DEBUG") != nullptr;
 
-  // dataType → element byte size. Unknown codes fall back to 4 (FP32-ish)
-  // with a stderr warning so testing surfaces the issue instead of silently
-  // corrupting memory.
+  reg_t control = desc[1];
+  reg_t dataType = control & 0xf;
+  reg_t rank = (control >> 4) & 0xf;
+  reg_t interleaveMode = (control >> 8) & 0x3;
+  reg_t swizzleMode = (control >> 10) & 0x3;
+  reg_t oobfill = (control >> 14) & 0x1;
+
+  reg_t globalAddress = desc[2];
+  reg_t globalDim[5];
+  reg_t byteStride[5];
+  reg_t boxDim[5];
+  reg_t eStride[5];
+  for (int i = 0; i < 5; i++) {
+    globalDim[i] = desc[4 + i];
+    byteStride[i] = desc[9 + i];
+    boxDim[i] = desc[14 + i];
+    eStride[i] = desc[19 + i] ? desc[19 + i] : 1;
+  }
+
   reg_t elemSize;
   switch (dataType) {
     case 0:  elemSize = 1; break; // UINT8
@@ -107,23 +81,91 @@
             (unsigned)rank);
     return npc;
   }
-  if (interleaveMode != 0) {
+  if (interleaveMode == 3) {
     fprintf(stderr,
-            "cp.async.tensor: unsupported interleaveMode=%u; skipping\n",
+            "cp.async.tensor: reserved interleaveMode=%u; skipping\n",
             (unsigned)interleaveMode);
     return npc;
   }
-  if (swizzleMode > 3) {
+  if (interleaveMode != 0 && rank < 3) {
     fprintf(stderr,
-            "cp.async.tensor: unsupported swizzleMode=%u; skipping\n",
-            (unsigned)swizzleMode);
+            "cp.async.tensor: interleaveMode=%u requires rank >= 3; skipping\n",
+            (unsigned)interleaveMode);
     return npc;
   }
 
-  // Per-dim byte stride in source. Zero dim_byte_stride(0) never happens (it's
-  // elemSize). dim_byte_stride(d>=1) is read from globalStrides[d-1].
-  auto dim_byte_stride = [&](reg_t d) -> reg_t {
-    return (d == 0) ? elemSize : gStride[d - 1];
+  // Descriptor v0 carries dim0 byte stride explicitly. Keep dense tests
+  // robust by accepting zero there as "elemSize".
+  if (byteStride[0] == 0)
+    byteStride[0] = elemSize;
+
+  auto tensor_addr = [&](const reg_t c[5]) -> reg_t {
+    if (interleaveMode == 0) {
+      reg_t addr = globalAddress;
+      for (reg_t d = 0; d < rank; d++)
+        addr += c[d] * byteStride[d];
+      return addr;
+    }
+
+    reg_t sliceBytes = (interleaveMode == 1) ? 16 : 32;
+    reg_t channelsPerSlice = elemSize ? (sliceBytes / elemSize) : 1;
+    if (channelsPerSlice == 0) channelsPerSlice = 1;
+    reg_t cSlice = c[0] / channelsPerSlice;
+    reg_t cInSlice = c[0] % channelsPerSlice;
+    reg_t cSliceStride = sliceBytes;
+    if (rank >= 3)
+      cSliceStride = byteStride[rank - 2] * globalDim[rank - 2];
+
+    reg_t addr = globalAddress + cInSlice * elemSize + cSlice * cSliceStride;
+    for (reg_t d = 1; d < rank; d++)
+      addr += c[d] * byteStride[d];
+    return addr;
+  };
+
+  reg_t boxAddr = tensor_addr(coords);
+
+  if (debug) {
+    fprintf(stderr,
+            "cp.async.tensor: dst=0x%08llx"
+            " desc=0x%08llx dyn_vreg=v%u"
+            " ctrl=0x%08llx rank=%u dtype=%u global=0x%08llx"
+            " coords=[%u,%u,%u,%u,%u] boxAddr=0x%08llx"
+            " gdim=[%u,%u,%u,%u,%u] stride=[%u,%u,%u,%u,%u]"
+            " box=[%u,%u,%u,%u,%u]\n",
+            (unsigned long long)dstAddr, (unsigned long long)descPtr,
+            (unsigned)insn.rs2(), (unsigned long long)control,
+            (unsigned)rank, (unsigned)dataType,
+            (unsigned long long)globalAddress,
+            (unsigned)coords[0], (unsigned)coords[1], (unsigned)coords[2],
+            (unsigned)coords[3], (unsigned)coords[4],
+            (unsigned long long)boxAddr,
+            (unsigned)globalDim[0], (unsigned)globalDim[1],
+            (unsigned)globalDim[2], (unsigned)globalDim[3],
+            (unsigned)globalDim[4],
+            (unsigned)byteStride[0], (unsigned)byteStride[1],
+            (unsigned)byteStride[2], (unsigned)byteStride[3],
+            (unsigned)byteStride[4],
+            (unsigned)boxDim[0], (unsigned)boxDim[1],
+            (unsigned)boxDim[2], (unsigned)boxDim[3],
+            (unsigned)boxDim[4]);
+  }
+
+  reg_t outDim[5] = {1, 1, 1, 1, 1};
+  for (reg_t d = 0; d < rank; d++) {
+    if (d == 0 || eStride[d] <= 1)
+      outDim[d] = boxDim[d];
+    else
+      outDim[d] = (boxDim[d] + eStride[d] - 1) / eStride[d];
+  }
+
+  auto is_integer_dtype = [&](reg_t dt) -> bool {
+    return dt <= 5 || dt == 9 || dt == 10;
+  };
+
+  auto fill_oob = [&](reg_t dst) {
+    uint8_t fill = (!is_integer_dtype(dataType) && oobfill) ? 0xff : 0x00;
+    for (reg_t b = 0; b < elemSize; b++)
+      MMU.store_uint8(dst + b, fill);
   };
 
   auto swizzle_dst_offset = [&](reg_t logical_off, reg_t row) -> reg_t {
@@ -137,63 +179,63 @@
     return (logical_off & ~(span - 1)) | ((chunk ^ row_low) << 4) | low;
   };
 
-  // Enumerate linear index `lin` in [0, ∏ boxDim[d]) and decompose it into
-  // per-dim indices (inner-most dim = 0). Compose source and destination
-  // offsets on the fly. This is O(total * rank) which is fine for all
-  // reasonable test sizes (up to a few KB).
   reg_t total = 1;
-  for (reg_t d = 0; d < rank; d++) total *= boxDim[d];
+  for (reg_t d = 0; d < rank; d++)
+    total *= outDim[d];
 
   for (reg_t lin = 0; lin < total; lin++) {
     reg_t idx[5] = {0, 0, 0, 0, 0};
     reg_t rem = lin;
     for (reg_t d = 0; d < rank; d++) {
-      idx[d] = rem % boxDim[d];
-      rem   /= boxDim[d];
+      idx[d] = rem % outDim[d];
+      rem /= outDim[d];
     }
 
-    reg_t src_off = 0;
+    reg_t logicalCoord[5] = {0, 0, 0, 0, 0};
+    bool oob = false;
     for (reg_t d = 0; d < rank; d++) {
-      src_off += idx[d] * eStride[d] * dim_byte_stride(d);
+      logicalCoord[d] = coords[d] + idx[d] * eStride[d];
+      if (logicalCoord[d] >= globalDim[d])
+        oob = true;
     }
 
     reg_t dst_off = 0;
     reg_t dst_mul = elemSize;
     for (reg_t d = 0; d < rank; d++) {
       dst_off += idx[d] * dst_mul;
-      dst_mul *= boxDim[d];
+      dst_mul *= outDim[d];
     }
     reg_t row = 0;
     reg_t row_mul = 1;
     for (reg_t d = 1; d < rank; d++) {
       row += idx[d] * row_mul;
-      row_mul *= boxDim[d];
+      row_mul *= outDim[d];
     }
     dst_off = swizzle_dst_offset(dst_off, row);
 
-    // Copy using the widest granule that divides elemSize, to keep logs
-    // readable and to avoid spurious sub-word load/store churn. Falls back
-    // to bytes for sizes MMU does not have a primitive for.
-    reg_t src = boxAddr + src_off;
+    reg_t src = tensor_addr(logicalCoord);
     reg_t dst = dstAddr + dst_off;
-    switch (elemSize) {
-      case 8:
-        MMU.store_uint64(dst, MMU.load_uint64(src));
-        break;
-      case 4:
-        MMU.store_uint32(dst, MMU.load_uint32(src));
-        break;
-      case 2:
-        MMU.store_uint16(dst, MMU.load_uint16(src));
-        break;
-      case 1:
-        MMU.store_uint8(dst, MMU.load_uint8(src));
-        break;
-      default:
-        for (reg_t b = 0; b < elemSize; b++) {
-          MMU.store_uint8(dst + b, MMU.load_uint8(src + b));
-        }
-        break;
+    if (oob) {
+      fill_oob(dst);
+    } else {
+      switch (elemSize) {
+        case 8:
+          MMU.store_uint64(dst, MMU.load_uint64(src));
+          break;
+        case 4:
+          MMU.store_uint32(dst, MMU.load_uint32(src));
+          break;
+        case 2:
+          MMU.store_uint16(dst, MMU.load_uint16(src));
+          break;
+        case 1:
+          MMU.store_uint8(dst, MMU.load_uint8(src));
+          break;
+        default:
+          for (reg_t b = 0; b < elemSize; b++)
+            MMU.store_uint8(dst + b, MMU.load_uint8(src + b));
+          break;
+      }
     }
   }
 }
