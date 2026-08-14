@@ -6,5 +6,5 @@
 #include "internals.h"
 #include "specialize.h"
 #include "tracer.h"
+#include "ventus_tma_v2_spec.h"
 #include <assert.h>
-

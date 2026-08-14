@@ -51,12 +51,27 @@ class warp_schedule_t
       workgroup_number=wg;
       workgroup_id=wg_id;
       barriers.resize(warp_number, 0);
+      tma_barrier_objects.clear();
       }
     void init_warp(const char *gpgpuarch);
     void set_barrier_1(uint64_t wid);
     void set_barrier_2(uint64_t wid);
     void set_barrier_0();
     bool get_barrier();
+    bool tma_barrier_exists(uint64_t owner, uint64_t address) const {
+      for (const auto& object : tma_barrier_objects)
+        if (object.first == owner && object.second == address) return true;
+      return false;
+    }
+    bool tma_barrier_allocate(uint64_t owner, uint64_t address) {
+      if (tma_barrier_exists(owner, address)) return true;
+      size_t owner_entries = 0;
+      for (const auto& object : tma_barrier_objects)
+        owner_entries += object.first == owner;
+      if (owner_entries >= 4) return false;
+      tma_barrier_objects.emplace_back(owner, address);
+      return true;
+    }
     void parse_gpgpuarch_string(const char *gpgpuarch);
     ~warp_schedule_t(){}
  
@@ -68,6 +83,7 @@ class warp_schedule_t
     size_t workgroup_size_y;
     size_t workgroup_size_z;
     std::vector<int> barriers;
+    std::vector<std::pair<uint64_t, uint64_t>> tma_barrier_objects;
     bool is_all_true;
     int barrier_counter;
     uint64_t lds_base,lds_size,pds_base,pds_size,knl_base, curr_wgid;
@@ -568,8 +584,30 @@ public:
 
   class gpgpu_unit_t{
     public:
+      struct tma_binding_state_t {
+        bool armed = false;
+        reg_t address = 0;
+        reg_t bytes = 0;
+        reg_t generation = 0;
+      };
+
       warp_schedule_t *w;
       csr_t_p rpc;
+      std::vector<tma_binding_state_t> tma_barrier_bindings;
+
+      tma_binding_state_t& tma_binding(reg_t wid) {
+        if (tma_barrier_bindings.size() <= wid)
+          tma_barrier_bindings.resize(wid + 1);
+        return tma_barrier_bindings[wid];
+      }
+
+      bool tma_barrier_exists(reg_t owner, reg_t address) const {
+        return w && w->tma_barrier_exists(owner, address);
+      }
+
+      bool tma_barrier_allocate(reg_t owner, reg_t address) {
+        return w && w->tma_barrier_allocate(owner, address);
+      }
     private:
       
       processor_t *p;
@@ -599,6 +637,9 @@ public:
     public:
       // clear simt-stack, map and intialize csr
       gpgpu_unit_t() :
+        w(0),
+        rpc(0),
+        tma_barrier_bindings(),
         p(0),
         numw(0),
         numt(0),

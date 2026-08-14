@@ -1120,6 +1120,7 @@ void processor_t::gpgpu_unit_t::reset(processor_t *const proc)
   csrmap[CSR_GIDZ] = gidz = std::make_shared<basic_csr_t>(proc, CSR_GIDZ, 0);    
   csrmap[CSR_PRINT] = clprintf = std::make_shared<basic_csr_t>(proc, CSR_PRINT, 0);    
   csrmap[CSR_RPC] = rpc = std::make_shared<basic_csr_t>(proc, CSR_RPC, 0);
+  csrmap[CSR_DMA_STATUS] = std::make_shared<basic_csr_t>(proc, CSR_DMA_STATUS, 0);
   csrmap[CSR_GL_ID_X] = std::make_shared<basic_csr_t>(proc, CSR_GL_ID_X, 0);
   csrmap[CSR_GL_ID_Y] = std::make_shared<basic_csr_t>(proc, CSR_GL_ID_Y, 0);
   csrmap[CSR_GL_ID_Z] = std::make_shared<basic_csr_t>(proc, CSR_GL_ID_Z, 0);
@@ -1134,6 +1135,7 @@ void processor_t::gpgpu_unit_t::reset(processor_t *const proc)
   lc_id_y = nullptr;
   lc_id_z = nullptr;
   gll_id = nullptr;
+  tma_barrier_bindings.clear();
   
   // initialize csrs to enable vecter extension
   reg_t mstatus_val = state->mstatus->read();

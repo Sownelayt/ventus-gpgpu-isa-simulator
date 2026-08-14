@@ -921,13 +921,14 @@ riscv_insn_ext_v_gpgpu = \
 	endprg \
 	barrier \
 	barriersub \
-	cp_async_copysize \
 	cp_async_bulk \
 	cp_async_tensor \
 	cp_async_bulk_s2g \
 	cp_async_tensor_s2g \
 	prefetch_tensormap \
-	cp_async_fence \
+	invalidate_tensormap \
+	cp_async_s2g_group \
+	cp_async_mbarrier_proxy \
 	vftta_vv \
 	vfexp_v \
 
