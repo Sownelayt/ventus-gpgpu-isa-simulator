@@ -163,16 +163,34 @@ for (unsigned d = 0; d < 5; ++d) {
   if (d < tma_rank) {
     if (tma_box[d] == 0 || tma_box[d] > 256)
       tma_fail(VENTUS_TMA_STATUS_INVALID_DESCRIPTOR, 8);
-    tma_counts[d] = tma_box[d];
+    const bool tma_stride_in_range =
+        tma_element_strides[d] >= 1 && tma_element_strides[d] <= 8;
+    if (!tma_stride_in_range ||
+        (d == 0 && tma_interleave == VENTUS_TMA_INTERLEAVE_NONE &&
+         tma_element_strides[d] != 1))
+      tma_fail(VENTUS_TMA_STATUS_INVALID_DESCRIPTOR, 9);
+    // Validation records the first architectural error but deliberately
+    // continues checking the descriptor.  Guard the derived count so an
+    // invalid zero stride cannot turn BadStride into a host SIGFPE.
+    if (tma_stride_in_range) {
+      const bool tma_channel_slice_metadata =
+          tma_interleave != VENTUS_TMA_INTERLEAVE_NONE &&
+          d + 2 == tma_rank;
+      if (d > 0 && !tma_channel_slice_metadata &&
+          tma_strides[d - 1] >
+              (~uint64_t{0}) / tma_element_strides[d])
+        tma_fail(VENTUS_TMA_STATUS_ADDRESS_OVERFLOW, 11);
+      tma_counts[d] = tma_channel_slice_metadata
+          ? 1
+          : (tma_box[d] + tma_element_strides[d] - 1) /
+                tma_element_strides[d];
+    }
   } else if (tma_dims[d] != 0 || tma_box[d] != 0 ||
              tma_element_strides[d] != 0 ||
              (d < 4 && tma_strides[d] != 0)) {
     tma_fail(VENTUS_TMA_STATUS_INVALID_DESCRIPTOR, 3);
   }
 }
-for (unsigned d = 0; d < tma_active_rank; ++d)
-  if (tma_element_strides[d] != 1)
-    tma_fail(VENTUS_TMA_STATUS_UNSUPPORTED_FEATURE, 12);
 if (tma_active_rank != 0)
   for (unsigned s = tma_active_rank - 1; s < 4; ++s)
     if (tma_strides[s] != 0)
@@ -235,23 +253,10 @@ if (tma_legal) {
       tma_bounding_origin += static_cast<__int128>(tma_coords[0]) *
                              (tma_dtype_bits / 8);
   } else {
-    const uint32_t tma_slice_bytes =
+    const uint32_t tma_atom_bytes =
         tma_interleave == VENTUS_TMA_INTERLEAVE_16B ? 16 : 32;
-    const uint32_t tma_channels = tma_slice_bytes / (tma_dtype_bits / 8);
-    const int64_t tma_coordinate0 = tma_coords[0];
-    const int64_t tma_slice = tma_coordinate0 >= 0
-        ? tma_coordinate0 / tma_channels
-        : -static_cast<int64_t>(
-              (static_cast<uint64_t>(-tma_coordinate0) + tma_channels - 1) /
-              tma_channels);
-    const uint32_t tma_in_slice =
-        static_cast<uint32_t>(tma_coordinate0) & (tma_channels - 1);
-    const __int128 tma_slice_stride =
-        static_cast<__int128>(tma_strides[tma_rank - 3]) *
-        tma_dims[tma_rank - 2];
-    tma_bounding_origin += static_cast<__int128>(tma_slice) *
-                           tma_slice_stride +
-                           tma_in_slice * (tma_dtype_bits / 8);
+    tma_bounding_origin += static_cast<__int128>(tma_coords[0]) *
+                           tma_atom_bytes;
   }
   for (unsigned d = 1; d < tma_active_rank; ++d)
     tma_bounding_origin += static_cast<__int128>(tma_coords[d]) *
@@ -266,7 +271,10 @@ uint64_t tma_logical_elements = tma_active_rank == 0 ? 0 : 1;
 for (unsigned d = 0; d < tma_active_rank; ++d)
   tma_logical_elements *= tma_counts[d];
 const uint64_t tma_logical_bytes =
-    (tma_logical_elements * tma_dtype_bits + 7) / 8;
+    tma_interleave == VENTUS_TMA_INTERLEAVE_NONE
+        ? (tma_logical_elements * tma_dtype_bits + 7) / 8
+        : tma_logical_elements *
+              (tma_interleave == VENTUS_TMA_INTERLEAVE_16B ? 16 : 32);
 if (!tma_s2g && tma_legal && tma_binding.armed) {
   const reg_t state = MMU.load_uint32(tma_binding.address + 4);
   if (tma_logical_bytes == 0 ||
@@ -284,6 +292,15 @@ auto tma_swizzle_offset = [&](uint32_t logical, uint32_t row) -> uint32_t {
          ((((logical >> 4) & mask) ^ ((row + phase) & mask)) << 4) |
          (logical & 15);
 };
+auto tma_interleave_swizzle_offset = [&](uint32_t logical) -> uint32_t {
+  if (tma_swizzle == VENTUS_TMA_SWIZZLE_NONE) return logical;
+  const uint32_t mask = (1u << tma_swizzle) - 1;
+  const uint32_t window =
+      (static_cast<uint32_t>(tma_shared_base) >> 7) + (logical >> 7);
+  return (logical & ~127u) |
+         ((((logical >> 4) & 7u) ^ (window & mask)) << 4) |
+         (logical & 15u);
+};
 auto tma_global_offset = [&](const int64_t coord[5]) -> uint64_t {
   const uint32_t elem_bytes = tma_dtype_bits / 8;
   if (tma_interleave == VENTUS_TMA_INTERLEAVE_NONE || tma_sub_byte) {
@@ -296,15 +313,9 @@ auto tma_global_offset = [&](const int64_t coord[5]) -> uint64_t {
       offset += static_cast<uint64_t>(coord[d]) * tma_strides[d - 1];
     return offset;
   }
-  const uint32_t slice_bytes =
+  const uint32_t atom_bytes =
       tma_interleave == VENTUS_TMA_INTERLEAVE_16B ? 16 : 32;
-  const uint32_t channels = slice_bytes / elem_bytes;
-  const uint64_t slice = static_cast<uint64_t>(coord[0]) / channels;
-  const uint64_t in_slice = static_cast<uint64_t>(coord[0]) % channels;
-  const uint64_t slice_stride =
-      static_cast<uint64_t>(tma_strides[tma_rank - 3]) *
-      tma_dims[tma_rank - 2];
-  uint64_t offset = in_slice * elem_bytes + slice * slice_stride;
+  uint64_t offset = static_cast<uint64_t>(coord[0]) * atom_bytes;
   for (unsigned d = 1; d < tma_rank; ++d)
     offset += static_cast<uint64_t>(coord[d]) * tma_strides[d - 1];
   return offset;
@@ -321,7 +332,8 @@ if (tma_legal) {
     uint32_t row_multiplier = 1;
     bool in_bounds = true;
     for (unsigned d = 0; d < tma_rank; ++d) {
-      coord[d] = tma_coords[d] + static_cast<int64_t>(index[d]);
+      coord[d] = tma_coords[d] +
+          static_cast<int64_t>(index[d]) * tma_element_strides[d];
       in_bounds = in_bounds && coord[d] >= 0 &&
                   static_cast<uint64_t>(coord[d]) < tma_dims[d];
       linear_element += static_cast<uint64_t>(index[d]) * multiplier;
@@ -387,6 +399,90 @@ if (tma_legal) {
             MMU.store_uint8(
                 tma_shared_base + tma_swizzle_offset(logical, row), 0);
           }
+      }
+    } else if (tma_interleave != VENTUS_TMA_INTERLEAVE_NONE) {
+      const uint32_t atom_bytes =
+          tma_interleave == VENTUS_TMA_INTERLEAVE_16B ? 16 : 32;
+      const uint64_t logical_byte = linear_element * atom_bytes;
+      if (in_bounds) {
+        const uint64_t global64 =
+            tma_global_base64 + tma_global_offset(coord);
+        if (global64 + atom_bytes - 1 > 0xffffffffULL) {
+          tma_fail(VENTUS_TMA_STATUS_ADDRESS_OVERFLOW, 11);
+        } else if (tma_reduce) {
+          // Interleave traversal selects a whole atom.  A legal 32-bit
+          // reduction therefore updates every word in that atom rather than
+          // only the scalar lane named by dtype.
+          for (unsigned word = 0; word < atom_bytes / 4; ++word) {
+            const uint32_t logical =
+                static_cast<uint32_t>(logical_byte + word * 4);
+            const reg_t shared = tma_shared_base +
+                tma_interleave_swizzle_offset(logical);
+            const reg_t global = static_cast<reg_t>(global64 + word * 4);
+            const uint32_t operand = MMU.load_uint32(shared);
+            const uint32_t old = MMU.load_uint32(global);
+            uint32_t result = old;
+            switch (tma_reduce_mode) {
+              case VENTUS_TMA_V2_REDUCE_ADD: result = old + operand; break;
+              case VENTUS_TMA_V2_REDUCE_MIN:
+                result = tma_dtype == VENTUS_TMA_DTYPE_S32
+                             ? (static_cast<int32_t>(old) <
+                                        static_cast<int32_t>(operand)
+                                    ? old : operand)
+                             : (old < operand ? old : operand);
+                break;
+              case VENTUS_TMA_V2_REDUCE_MAX:
+                result = tma_dtype == VENTUS_TMA_DTYPE_S32
+                             ? (static_cast<int32_t>(old) >
+                                        static_cast<int32_t>(operand)
+                                    ? old : operand)
+                             : (old > operand ? old : operand);
+                break;
+              case VENTUS_TMA_V2_REDUCE_AND: result = old & operand; break;
+              case VENTUS_TMA_V2_REDUCE_OR: result = old | operand; break;
+              case VENTUS_TMA_V2_REDUCE_XOR: result = old ^ operand; break;
+            }
+            MMU.store_uint32(global, result);
+          }
+        } else {
+          for (unsigned byte = 0; byte < atom_bytes; ++byte) {
+            const uint32_t logical =
+                static_cast<uint32_t>(logical_byte + byte);
+            const reg_t shared = tma_shared_base +
+                tma_interleave_swizzle_offset(logical);
+            const reg_t global = static_cast<reg_t>(global64 + byte);
+            if (tma_s2g)
+              MMU.store_uint8(global, MMU.load_uint8(shared));
+            else
+              MMU.store_uint8(shared, MMU.load_uint8(global));
+          }
+        }
+      } else if (!tma_s2g) {
+        const uint8_t fp16_nan[2] = {0x00, 0x7e};
+        const uint8_t bf16_nan[2] = {0xc0, 0x7f};
+        const uint8_t fp32_nan[4] = {0x00, 0x00, 0xc0, 0x7f};
+        const uint8_t fp64_nan[8] = {0, 0, 0, 0, 0, 0, 0xf8, 0x7f};
+        const uint32_t nan_period =
+            tma_dtype_bits >= 8 ? tma_dtype_bits / 8 : 1;
+        for (unsigned byte = 0; byte < atom_bytes; ++byte) {
+          const uint32_t logical =
+              static_cast<uint32_t>(logical_byte + byte);
+          const reg_t shared = tma_shared_base +
+              tma_interleave_swizzle_offset(logical);
+          uint8_t fill = 0;
+          const uint32_t nan_byte = byte % nan_period;
+          if (tma_oob_fill == VENTUS_TMA_OOB_NAN) {
+            if (tma_dtype == VENTUS_TMA_DTYPE_FP16)
+              fill = fp16_nan[nan_byte];
+            else if (tma_dtype == VENTUS_TMA_DTYPE_BF16)
+              fill = bf16_nan[nan_byte];
+            else if (tma_dtype == VENTUS_TMA_DTYPE_FP64)
+              fill = fp64_nan[nan_byte];
+            else
+              fill = fp32_nan[nan_byte];
+          }
+          MMU.store_uint8(shared, fill);
+        }
       }
     } else {
       const bool packed_skip = tma_dtype_bits == 4 && (index[0] & 1);
